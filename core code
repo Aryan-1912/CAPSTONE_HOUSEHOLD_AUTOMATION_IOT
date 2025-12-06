@@ -1,0 +1,531 @@
+/*
+ * ESP32 Smart Home Controller
+ * Arduino IDE Version - Matches Wokwi Simulation
+ */
+
+#include <WiFi.h>
+#include <PubSubClient.h>
+#include <DHT.h>
+#include <ArduinoJson.h>
+
+// ========== CHANGE THESE ==========
+const char* WIFI_SSID = "Aryan_2503";
+const char* WIFI_PASSWORD = "Aryan123";
+
+// ========== DEVICE CONFIG ==========
+const char* DEVICE_ID = "wokwi001";
+const char* MQTT_BROKER = "test.mosquitto.org";
+const int MQTT_PORT = 1883;
+
+// MQTT Topics
+String TELEMETRY_TOPIC;
+String CONTROL_TOPIC;
+
+// ========== PIN DEFINITIONS ==========
+#define RED_LED     14    // was 12
+#define GREEN_LED   13
+#define BLUE_LED    12    // was 14
+#define DHT_PIN     15
+#define AC_RELAY    25
+#define FAN_RELAY   26
+#define FAN_SPEED   27
+
+#define DHT_TYPE    DHT22
+
+// ========== LED ACTIVE LOW FIX ==========
+// Your LEDs are active-low (common anode)
+// LOW = ON, HIGH = OFF
+#define LED_ON      LOW
+#define LED_OFF     HIGH
+
+// ========== OBJECTS ==========
+WiFiClient wifiClient;
+PubSubClient mqtt(wifiClient);
+DHT dht(DHT_PIN, DHT_TYPE);
+
+// ========== STATE VARIABLES ==========
+// AC State
+bool acPower = false;
+int acTargetTemp = 24;
+String acMode = "cool";
+
+// Fan State
+bool fanPower = false;
+int fanSpeed = 2;
+
+// Energy Data
+unsigned long redLedMinutes = 0;
+unsigned long greenLedMinutes = 0;
+unsigned long blueLedMinutes = 0;
+unsigned long acMinutes = 0;
+unsigned long fanMinutes = 0;
+
+// LED Manual Mode
+bool redManual = false;
+bool greenManual = false;
+
+// Sensor Data
+float temperature = 0;
+float humidity = 0;
+
+// Timing
+unsigned long lastSensorRead = 0;
+unsigned long lastPublish = 0;
+unsigned long lastFlash = 0;
+unsigned long lastEnergyTrack = 0;
+
+#define SENSOR_INTERVAL     5000
+#define PUBLISH_INTERVAL    5000
+#define FLASH_INTERVAL      500
+#define ENERGY_INTERVAL     20000
+
+// Blue LED state for heartbeat
+bool blueLedState = false;
+
+// ========== SETUP ==========
+void setup() {
+    Serial.begin(115200);
+    delay(1000);
+    
+    Serial.println();
+    Serial.println("==================================================");
+    Serial.println("        ESP32 SMART HOME CONTROLLER");
+    Serial.println("        REAL-TIME MODE - 5 Second Updates");
+    Serial.println("==================================================");
+    Serial.println();
+    
+    // Build topics
+    TELEMETRY_TOPIC = "iot/" + String(DEVICE_ID) + "/telemetry";
+    CONTROL_TOPIC = "iot/" + String(DEVICE_ID) + "/control";
+    
+    // Init pins
+    pinMode(RED_LED, OUTPUT);
+    pinMode(GREEN_LED, OUTPUT);
+    pinMode(BLUE_LED, OUTPUT);
+    pinMode(AC_RELAY, OUTPUT);
+    pinMode(FAN_RELAY, OUTPUT);
+    pinMode(FAN_SPEED, OUTPUT);
+    
+    // All OFF (LED_OFF = HIGH for active-low LEDs)
+    digitalWrite(RED_LED, LED_OFF);
+    digitalWrite(GREEN_LED, LED_OFF);
+    digitalWrite(BLUE_LED, LED_OFF);
+    digitalWrite(AC_RELAY, LOW);
+    digitalWrite(FAN_RELAY, LOW);
+    digitalWrite(FAN_SPEED, LOW);
+    
+    Serial.println("All LEDs OFF at startup");
+    
+    // Init DHT
+    dht.begin();
+    
+    // Connect WiFi
+    connectWiFi();
+    
+    // Setup MQTT
+    mqtt.setServer(MQTT_BROKER, MQTT_PORT);
+    mqtt.setCallback(mqttCallback);
+    mqtt.setBufferSize(1024);
+    
+    // Connect MQTT
+    connectMQTT();
+    
+    // Initial read
+    readSensor();
+    
+    // Publish initial status
+    publishStatus();
+    
+    Serial.println();
+    Serial.println("SYSTEM READY!");
+    Serial.println("Control Topic: " + CONTROL_TOPIC);
+    Serial.println("Telemetry Topic: " + TELEMETRY_TOPIC);
+    Serial.println();
+    Serial.println("REAL-TIME MODE:");
+    Serial.println("  - Sensor readings every 5 seconds");
+    Serial.println("  - Instant updates on commands");
+    Serial.println("  - Fast app synchronization");
+    Serial.println();
+    Serial.println("Starting main loop with REAL-TIME updates...");
+    Serial.println();
+}
+
+// ========== MAIN LOOP ==========
+void loop() {
+    // Keep MQTT alive
+    if (!mqtt.connected()) {
+        connectMQTT();
+    }
+    mqtt.loop();
+    
+    unsigned long now = millis();
+    
+    // Heartbeat - Blue LED flash
+    if (now - lastFlash >= FLASH_INTERVAL) {
+        blueLedState = !blueLedState;
+        digitalWrite(BLUE_LED, blueLedState ? LED_ON : LED_OFF);
+        lastFlash = now;
+    }
+    
+    // Read sensor
+    if (now - lastSensorRead >= SENSOR_INTERVAL) {
+        readSensor();
+        lastSensorRead = now;
+    }
+    
+    // Publish status
+    if (now - lastPublish >= PUBLISH_INTERVAL) {
+        publishStatus();
+        lastPublish = now;
+    }
+    
+    // Energy tracking
+    if (now - lastEnergyTrack >= ENERGY_INTERVAL) {
+        trackEnergy();
+        lastEnergyTrack = now;
+    }
+    
+    delay(100);
+}
+
+// ========== WIFI CONNECTION ==========
+void connectWiFi() {
+    Serial.println("Initializing WiFi...");
+    Serial.print("Connecting to '");
+    Serial.print(WIFI_SSID);
+    Serial.println("'...");
+    
+    WiFi.mode(WIFI_STA);
+    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+    
+    int attempts = 0;
+    while (WiFi.status() != WL_CONNECTED && attempts < 30) {
+        delay(1000);
+        if (attempts % 5 == 0) {
+            Serial.print("Status: ");
+            Serial.print(WiFi.status());
+            Serial.print(", Attempt: ");
+            Serial.print(attempts + 1);
+            Serial.println("/30");
+        }
+        attempts++;
+    }
+    
+    if (WiFi.status() == WL_CONNECTED) {
+        Serial.println();
+        Serial.println("WiFi Connected!");
+        Serial.print("IP: ");
+        Serial.println(WiFi.localIP());
+        Serial.print("Time: ");
+        Serial.print(attempts);
+        Serial.println(" seconds");
+        Serial.println();
+    } else {
+        Serial.println();
+        Serial.println("WiFi connection failed!");
+        Serial.println("ERROR: Cannot connect to WiFi");
+        // Blink red LED for error
+        while (true) {
+            digitalWrite(RED_LED, LED_ON);
+            delay(500);
+            digitalWrite(RED_LED, LED_OFF);
+            delay(500);
+        }
+    }
+}
+
+// ========== MQTT CONNECTION ==========
+void connectMQTT() {
+    Serial.println("Connecting to MQTT...");
+    
+    while (!mqtt.connected()) {
+        if (mqtt.connect(DEVICE_ID)) {
+            Serial.println("MQTT Connected!");
+            mqtt.subscribe(CONTROL_TOPIC.c_str());
+            Serial.print("Subscribed to: ");
+            Serial.println(CONTROL_TOPIC);
+        } else {
+            Serial.print("MQTT Connection failed: ");
+            Serial.println(mqtt.state());
+            Serial.println("Retrying in 5 seconds...");
+            delay(5000);
+        }
+    }
+}
+
+// ========== READ SENSOR ==========
+void readSensor() {
+    float t = dht.readTemperature();
+    float h = dht.readHumidity();
+    
+    if (!isnan(t) && !isnan(h)) {
+        temperature = t;
+        humidity = h;
+    } else {
+        Serial.println("Sensor read error");
+    }
+}
+
+// ========== HELPER: Check if LED is ON ==========
+bool isLedOn(int pin) {
+    // For active-low: LOW means ON
+    return (digitalRead(pin) == LED_ON);
+}
+
+// ========== AC CONTROL ==========
+void controlAC(String power, int targetTemp, String mode) {
+    if (targetTemp > 0) {
+        acTargetTemp = targetTemp;
+    }
+    if (mode.length() > 0) {
+        acMode = mode;
+    }
+    
+    if (power == "ON") {
+        digitalWrite(AC_RELAY, HIGH);
+        acPower = true;
+        Serial.print("AC ON - Target: ");
+        Serial.print(acTargetTemp);
+        Serial.println("°C");
+    } else {
+        digitalWrite(AC_RELAY, LOW);
+        acPower = false;
+        Serial.println("AC OFF");
+    }
+}
+
+// ========== FAN CONTROL ==========
+void controlFan(String power, int speed) {
+    if (speed >= 1 && speed <= 3) {
+        fanSpeed = speed;
+    }
+    
+    if (power == "ON") {
+        digitalWrite(FAN_RELAY, HIGH);
+        fanPower = true;
+        
+        if (fanSpeed == 1) {
+            digitalWrite(FAN_SPEED, LOW);
+            Serial.println("Fan ON - Speed: LOW (1)");
+        } else if (fanSpeed == 2) {
+            Serial.println("Fan ON - Speed: MEDIUM (2)");
+        } else {
+            digitalWrite(FAN_SPEED, HIGH);
+            Serial.println("Fan ON - Speed: HIGH (3)");
+        }
+    } else {
+        digitalWrite(FAN_RELAY, LOW);
+        digitalWrite(FAN_SPEED, LOW);
+        fanPower = false;
+        Serial.println("Fan OFF");
+    }
+}
+
+// ========== ENERGY TRACKING ==========
+void trackEnergy() {
+    // Add 3 minutes for demo mode (matches Wokwi)
+    if (isLedOn(RED_LED)) redLedMinutes += 3;
+    if (isLedOn(GREEN_LED)) greenLedMinutes += 3;
+    if (isLedOn(BLUE_LED)) blueLedMinutes += 3;
+    if (digitalRead(AC_RELAY)) acMinutes += 3;
+    if (digitalRead(FAN_RELAY)) fanMinutes += 3;
+    
+    Serial.print("Energy tracked: AC=");
+    Serial.print(acMinutes);
+    Serial.print("min, Fan=");
+    Serial.print(fanMinutes);
+    Serial.println("min");
+}
+
+// ========== SCHEDULE EXECUTION ==========
+void executeSchedule(JsonDocument& doc) {
+    String name = doc["name"] | "Unnamed";
+    Serial.print("Executing Schedule: ");
+    Serial.println(name);
+    
+    JsonArray actions = doc["actions"].as<JsonArray>();
+    
+    for (JsonObject action : actions) {
+        String device = action["device"] | "";
+        String state = action["state"] | "OFF";
+        
+        device.toLowerCase();
+        state.toUpperCase();
+        
+        if (device == "ac") {
+            int temp = action["temperature"] | 24;
+            String mode = action["mode"] | "cool";
+            controlAC(state, temp, mode);
+        }
+        else if (device == "fan") {
+            int speed = action["speed"] | 2;
+            controlFan(state, speed);
+        }
+        else if (device == "red") {
+            if (state == "ON") {
+                digitalWrite(RED_LED, LED_ON);
+                redManual = true;
+            } else {
+                digitalWrite(RED_LED, LED_OFF);
+                redManual = false;
+            }
+        }
+        else if (device == "green") {
+            if (state == "ON") {
+                digitalWrite(GREEN_LED, LED_ON);
+                greenManual = true;
+            } else {
+                digitalWrite(GREEN_LED, LED_OFF);
+                greenManual = false;
+            }
+        }
+        else if (device == "all_leds") {
+            if (state == "ON") {
+                digitalWrite(RED_LED, LED_ON);
+                digitalWrite(GREEN_LED, LED_ON);
+                redManual = true;
+                greenManual = true;
+            } else {
+                digitalWrite(RED_LED, LED_OFF);
+                digitalWrite(GREEN_LED, LED_OFF);
+                redManual = false;
+                greenManual = false;
+            }
+        }
+    }
+    
+    publishStatus();
+}
+
+// ========== MQTT CALLBACK ==========
+void mqttCallback(char* topic, byte* payload, unsigned int length) {
+    Serial.println();
+    Serial.println("Command received!");
+    
+    String topicStr = String(topic);
+    String message = "";
+    for (unsigned int i = 0; i < length; i++) {
+        message += (char)payload[i];
+    }
+    
+    Serial.print("Topic: ");
+    Serial.println(topicStr);
+    Serial.print("Message: ");
+    Serial.println(message);
+    
+    if (topicStr == CONTROL_TOPIC) {
+        StaticJsonDocument<512> doc;
+        DeserializationError error = deserializeJson(doc, message);
+        
+        if (error) {
+            Serial.print("Command parsing error: ");
+            Serial.println(error.c_str());
+            return;
+        }
+        
+        // Get LED and state
+        String ledName = doc["led"] | "";
+        String state = doc["state"] | "";
+        ledName.toLowerCase();
+        state.toUpperCase();
+        
+        // LED Control
+        if (ledName == "red") {
+            if (state == "ON") {
+                digitalWrite(RED_LED, LED_ON);
+                redManual = true;
+                Serial.println("RED LED ON");
+            } else if (state == "OFF") {
+                digitalWrite(RED_LED, LED_OFF);
+                redManual = false;
+                Serial.println("RED LED OFF");
+            }
+        }
+        else if (ledName == "green") {
+            if (state == "ON") {
+                digitalWrite(GREEN_LED, LED_ON);
+                greenManual = true;
+                Serial.println("GREEN LED ON");
+            } else if (state == "OFF") {
+                digitalWrite(GREEN_LED, LED_OFF);
+                greenManual = false;
+                Serial.println("GREEN LED OFF");
+            }
+        }
+        else if (ledName == "both" || ledName == "all") {
+            if (state == "ON") {
+                digitalWrite(RED_LED, LED_ON);
+                digitalWrite(GREEN_LED, LED_ON);
+                redManual = true;
+                greenManual = true;
+                Serial.println("ALL LEDs ON");
+            } else if (state == "OFF") {
+                digitalWrite(RED_LED, LED_OFF);
+                digitalWrite(GREEN_LED, LED_OFF);
+                redManual = false;
+                greenManual = false;
+                Serial.println("ALL LEDs OFF");
+            }
+        }
+        
+        // Device Control
+        String device = doc["device"] | "";
+        device.toLowerCase();
+        
+        if (device == "ac") {
+            int temp = doc["temperature"] | 24;
+            String mode = doc["mode"] | "cool";
+            controlAC(state, temp, mode);
+        }
+        else if (device == "fan") {
+            int speed = doc["speed"] | 2;
+            controlFan(state, speed);
+        }
+        else if (device == "schedule") {
+            executeSchedule(doc);
+        }
+        
+        // Publish updated status
+        publishStatus();
+    }
+}
+
+// ========== PUBLISH STATUS ==========
+void publishStatus() {
+    StaticJsonDocument<512> doc;
+    
+    doc["device_id"] = DEVICE_ID;
+    doc["red_led"] = isLedOn(RED_LED) ? 1 : 0;
+    doc["green_led"] = isLedOn(GREEN_LED) ? 1 : 0;
+    doc["blue_led"] = isLedOn(BLUE_LED) ? 1 : 0;
+    doc["temperature"] = temperature;
+    doc["humidity"] = humidity;
+    doc["ac_power"] = acPower;
+    doc["ac_target_temp"] = acTargetTemp;
+    doc["ac_mode"] = acMode;
+    doc["fan_power"] = fanPower;
+    doc["fan_speed"] = fanSpeed;
+    
+    JsonObject energy = doc.createNestedObject("energy");
+    energy["red_led_minutes"] = redLedMinutes;
+    energy["green_led_minutes"] = greenLedMinutes;
+    energy["blue_led_minutes"] = blueLedMinutes;
+    energy["ac_minutes"] = acMinutes;
+    energy["fan_minutes"] = fanMinutes;
+    
+    doc["timestamp"] = millis() / 1000;
+    
+    String output;
+    serializeJson(doc, output);
+    
+    mqtt.publish(TELEMETRY_TOPIC.c_str(), output.c_str());
+    
+    Serial.print("Published: Temp=");
+    Serial.print(temperature);
+    Serial.print("°C, Hum=");
+    Serial.print(humidity);
+    Serial.print("%, AC=");
+    Serial.print(acPower ? "True" : "False");
+    Serial.print(", Fan=");
+    Serial.println(fanPower ? "True" : "False");
+}
