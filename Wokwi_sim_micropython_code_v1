@@ -1,0 +1,971 @@
+from machine import Pin
+from umqtt.simple import MQTTClient
+import ujson
+import network
+import utime as time
+import dht
+from machine import Pin
+from umqtt.simple import MQTTClient
+import ujson
+import network
+import utime as time
+import dht
+
+# ----------------------------
+# Device setup
+# ----------------------------
+DEVICE_ID = "wokwi001"
+
+# WiFi setup
+WIFI_SSID = "Wokwi-GUEST"
+WIFI_PASSWORD = ""
+
+# MQTT setup
+MQTT_BROKER = "test.mosquitto.org"
+MQTT_PORT = 1883
+MQTT_TELEMETRY_TOPIC = f"iot/{DEVICE_ID}/telemetry"
+MQTT_CONTROL_TOPIC = f"iot/{DEVICE_ID}/control"
+
+# LED setup
+RED_LED = Pin(12, Pin.OUT)
+GREEN_LED = Pin(13, Pin.OUT)
+BLUE_LED = Pin(14, Pin.OUT)
+
+# DHT Sensor setup
+DHT_PIN = 15
+sensor = dht.DHT22(Pin(DHT_PIN))
+
+# AC & FAN Hardware
+AC_RELAY = Pin(25, Pin.OUT)
+FAN_RELAY = Pin(26, Pin.OUT)
+FAN_SPEED_PIN = Pin(27, Pin.OUT)
+
+# State Variables
+ac_state = {
+    "power": False,
+    "target_temp": 24,
+    "mode": "cool"
+}
+
+fan_state = {
+    "power": False,
+    "speed": 2
+}
+
+# Energy tracking
+energy_data = {
+    "red_led_minutes": 0,
+    "green_led_minutes": 0,
+    "blue_led_minutes": 0,
+    "ac_minutes": 0,
+    "fan_minutes": 0,
+    "last_energy_track": time.time()
+}
+
+# Start with all devices OFF
+RED_LED.off()
+GREEN_LED.off()
+BLUE_LED.off()
+AC_RELAY.off()
+FAN_RELAY.off()
+FAN_SPEED_PIN.off()
+
+# Global variables
+mqtt_client = None
+led_manual_mode = {"red": False, "green": False}
+
+# ----------------------------
+# Sensor Reading Function
+# ----------------------------
+def read_sensor():
+    """Read temperature and humidity from DHT22 sensor"""
+    try:
+        sensor.measure()
+        temp = sensor.temperature()
+        humidity = sensor.humidity()
+        return temp, humidity
+    except Exception as e:
+        print(f"Sensor read error: {e}")
+        return None, None
+
+# ----------------------------
+# AC Control Function
+# ----------------------------
+def control_ac(power, target_temp=None, mode=None):
+    """Control AC relay and settings"""
+    global ac_state
+    
+    if target_temp is not None:
+        ac_state["target_temp"] = target_temp
+    
+    if mode is not None:
+        ac_state["mode"] = mode
+    
+    if power == "ON" or power == True or power == 1:
+        AC_RELAY.on()
+        ac_state["power"] = True
+        print(f"AC ON - Target: {ac_state['target_temp']}°C")
+    else:
+        AC_RELAY.off()
+        ac_state["power"] = False
+        print("AC OFF")
+    
+    return ac_state
+
+# ----------------------------
+# Fan Control Function
+# ----------------------------
+def control_fan(power, speed=None):
+    """Control Fan relay and speed"""
+    global fan_state
+    
+    if speed is not None:
+        fan_state["speed"] = max(1, min(3, int(speed)))
+    
+    if power == "ON" or power == True or power == 1:
+        FAN_RELAY.on()
+        fan_state["power"] = True
+        
+        if fan_state["speed"] == 1:
+            FAN_SPEED_PIN.off()
+            print("Fan ON - Speed: LOW (1)")
+        elif fan_state["speed"] == 2:
+            print("Fan ON - Speed: MEDIUM (2)")
+        else:
+            FAN_SPEED_PIN.on()
+            print("Fan ON - Speed: HIGH (3)")
+    else:
+        FAN_RELAY.off()
+        FAN_SPEED_PIN.off()
+        fan_state["power"] = False
+        print("Fan OFF")
+    
+    return fan_state
+
+# ----------------------------
+# Energy Tracking Function - DEMO MODE
+# ----------------------------
+def track_energy():
+    """Track energy usage - FAST MODE for demo (adds 3 minutes each time)"""
+    global energy_data
+    
+    current_time = time.time()
+    elapsed = (current_time - energy_data["last_energy_track"])
+    
+    # Add 3 minutes worth of tracking each time for visible demo
+    if elapsed >= 20:  # Every 20 seconds
+        if RED_LED.value():
+            energy_data["red_led_minutes"] += 3  # Add 3 minutes for demo
+        if GREEN_LED.value():
+            energy_data["green_led_minutes"] += 3
+        if BLUE_LED.value():
+            energy_data["blue_led_minutes"] += 3
+        if AC_RELAY.value():
+            energy_data["ac_minutes"] += 3  # Add 3 minutes for visible cost changes
+        if FAN_RELAY.value():
+            energy_data["fan_minutes"] += 3
+        
+        energy_data["last_energy_track"] = current_time
+        print(f"Energy tracked: AC={energy_data['ac_minutes']}min, Fan={energy_data['fan_minutes']}min")
+
+# ----------------------------
+# Schedule Execution Function
+# ----------------------------
+def execute_schedule(schedule_cmd):
+    """Execute scheduled actions"""
+    print(f"Executing Schedule: {schedule_cmd.get('name', 'Unnamed')}")
+    
+    actions = schedule_cmd.get("actions", [])
+    
+    for action in actions:
+        device = action.get("device", "").lower()
+        state = action.get("state", "OFF").upper()
+        
+        if device == "ac":
+            temp = action.get("temperature", 24)
+            mode = action.get("mode", "cool")
+            control_ac(state, temp, mode)
+        
+        elif device == "fan":
+            speed = action.get("speed", 2)
+            control_fan(state, speed)
+        
+        elif device == "red":
+            if state == "ON":
+                RED_LED.on()
+                led_manual_mode["red"] = True
+            else:
+                RED_LED.off()
+                led_manual_mode["red"] = False
+        
+        elif device == "green":
+            if state == "ON":
+                GREEN_LED.on()
+                led_manual_mode["green"] = True
+            else:
+                GREEN_LED.off()
+                led_manual_mode["green"] = False
+        
+        elif device == "all_leds":
+            if state == "ON":
+                RED_LED.on()
+                GREEN_LED.on()
+                led_manual_mode["red"] = True
+                led_manual_mode["green"] = True
+            else:
+                RED_LED.off()
+                GREEN_LED.off()
+                led_manual_mode["red"] = False
+                led_manual_mode["green"] = False
+    
+    publish_status()
+
+# ----------------------------
+# Callback Function
+# ----------------------------
+def did_receive_callback(topic, msg):
+    print("\nCommand received!")
+    
+    try:
+        topic_str = topic.decode('utf-8')
+        msg_str = msg.decode('utf-8').strip()
+        print(f"Topic: {topic_str}")
+        print(f"Message: {msg_str}")
+    except Exception as e:
+        print("Decoding error:", e)
+        return
+    
+    if topic_str == MQTT_CONTROL_TOPIC:
+        try:
+            cmd = ujson.loads(msg_str)
+            
+            # Original LED Control
+            led_name = cmd.get("led", "").lower()
+            state = cmd.get("state", "").upper()
+            
+            if led_name == "red":
+                if state == "ON":
+                    RED_LED.on()
+                    led_manual_mode["red"] = True
+                    print("RED LED ON")
+                elif state == "OFF":
+                    RED_LED.off()
+                    led_manual_mode["red"] = False
+                    print("RED LED OFF")
+                    
+            elif led_name == "green":
+                if state == "ON":
+                    GREEN_LED.on()
+                    led_manual_mode["green"] = True
+                    print("GREEN LED ON")
+                elif state == "OFF":
+                    GREEN_LED.off()
+                    led_manual_mode["green"] = False
+                    print("GREEN LED OFF")
+                    
+            elif led_name == "both" or led_name == "all":
+                if state == "ON":
+                    RED_LED.on()
+                    GREEN_LED.on()
+                    led_manual_mode["red"] = True
+                    led_manual_mode["green"] = True
+                    print("ALL LEDs ON")
+                elif state == "OFF":
+                    RED_LED.off()
+                    GREEN_LED.off()
+                    led_manual_mode["red"] = False
+                    led_manual_mode["green"] = False
+                    print("ALL LEDs OFF")
+            
+            # New Device Controls
+            device = cmd.get("device", "").lower()
+            
+            if device == "ac":
+                temp = cmd.get("temperature", 24)
+                mode = cmd.get("mode", "cool")
+                control_ac(state, temp, mode)
+            
+            elif device == "fan":
+                speed = cmd.get("speed", 2)
+                control_fan(state, speed)
+            
+            elif device == "schedule":
+                execute_schedule(cmd)
+            
+            # Immediately publish updated status
+            publish_status()
+            
+        except Exception as e:
+            print(f"Command parsing error: {e}")
+
+# ----------------------------
+# Status Publishing (FASTER UPDATES!)
+# ----------------------------
+def publish_status():
+    """Publish current status - called frequently for real-time updates"""
+    try:
+        temp, humidity = read_sensor()
+        
+        status = {
+            "device_id": DEVICE_ID,
+            "red_led": RED_LED.value(),
+            "green_led": GREEN_LED.value(),
+            "blue_led": BLUE_LED.value(),
+            "temperature": temp,
+            "humidity": humidity,
+            "ac_power": ac_state["power"],
+            "ac_target_temp": ac_state["target_temp"],
+            "ac_mode": ac_state["mode"],
+            "fan_power": fan_state["power"],
+            "fan_speed": fan_state["speed"],
+            "energy": energy_data.copy(),
+            "timestamp": time.time()
+        }
+        
+        mqtt_client.publish(MQTT_TELEMETRY_TOPIC, ujson.dumps(status))
+        print(f"Published: Temp={temp}°C, Hum={humidity}%, AC={ac_state['power']}, Fan={fan_state['power']}")
+    except Exception as e:
+        print(f"Publish error: {e}")
+
+# ----------------------------
+# MQTT Functions
+# ----------------------------
+def mqtt_connect():
+    global mqtt_client
+    print("Connecting to MQTT...")
+    
+    try:
+        client = MQTTClient(DEVICE_ID, MQTT_BROKER, port=MQTT_PORT)
+        client.set_callback(did_receive_callback)
+        client.connect()
+        print("MQTT Connected!")
+        
+        client.subscribe(MQTT_CONTROL_TOPIC)
+        print(f"Subscribed to: {MQTT_CONTROL_TOPIC}")
+        
+        mqtt_client = client
+        return client
+    except Exception as e:
+        print(f"MQTT Connection failed: {e}")
+        return None
+
+# ----------------------------
+# WiFi Connection - WOKWI OPTIMIZED
+# ----------------------------
+def connect_wifi():
+    print("Initializing WiFi...")
+    
+    # Initialize WiFi interface properly
+    wlan = network.WLAN(network.STA_IF)
+    wlan.active(False)  # Turn off first
+    time.sleep(0.1)
+    wlan.active(True)   # Turn on fresh
+    time.sleep(0.5)     # Let it initialize
+    
+    print(f"Connecting to '{WIFI_SSID}'...")
+    
+    # Connect
+    wlan.connect(WIFI_SSID, WIFI_PASSWORD)
+    
+    # Wait for connection with longer timeout for Wokwi
+    max_wait = 30
+    for i in range(max_wait):
+        status = wlan.status()
+        
+        # Check if connected
+        if wlan.isconnected():
+            print(f"\nWiFi Connected!")
+            print(f"IP: {wlan.ifconfig()[0]}")
+            print(f"Time: {i+1} seconds\n")
+            return True
+        
+        # Show status
+        if i % 5 == 0:
+            print(f"Status: {status}, Attempt: {i+1}/{max_wait}")
+        
+        time.sleep(1)
+    
+    print("\nWiFi connection failed!")
+    print(f"Final status: {wlan.status()}")
+    return False
+
+# ----------------------------
+# Main Program
+# ----------------------------
+print("\n" + "="*50)
+print("ESP32 SMART HOME CONTROLLER")
+print("REAL-TIME MODE - 5 Second Updates")
+print("="*50 + "\n")
+
+# Connect WiFi
+if not connect_wifi():
+    print("ERROR: Cannot connect to WiFi")
+    while True:
+        RED_LED.on()
+        time.sleep(0.5)
+        RED_LED.off()
+        time.sleep(0.5)
+
+# Connect MQTT
+mqtt_client = mqtt_connect()
+if not mqtt_client:
+    print("ERROR: Cannot connect to MQTT")
+    while True:
+        RED_LED.on()
+        time.sleep(0.2)
+        RED_LED.off()
+        time.sleep(0.2)
+
+print("\nSYSTEM READY!")
+print(f"Control Topic: {MQTT_CONTROL_TOPIC}")
+print(f"Telemetry Topic: {MQTT_TELEMETRY_TOPIC}")
+print("\nREAL-TIME MODE:")
+print("  - Sensor readings every 5 seconds")
+print("  - Instant updates on commands")
+print("  - Fast app synchronization")
+print("")
+
+# Test sensor
+temp, hum = read_sensor()
+if temp is not None:
+    print(f"Initial reading: {temp}°C, {hum}%\n")
+
+# Publish initial status
+publish_status()
+
+# ----------------------------
+# Main Loop - REAL-TIME UPDATES!
+# ----------------------------
+counter = 0
+last_sensor_read = time.time()
+last_heartbeat = time.time()
+last_flash = time.time()
+last_energy_check = time.time()
+
+SENSOR_INTERVAL = 5        # Read sensor every 5 seconds
+HEARTBEAT_INTERVAL = 5     # Publish status every 5 seconds
+FLASH_INTERVAL = 0.5       # Heartbeat LED
+ENERGY_CHECK_INTERVAL = 20 # Track energy every 20 seconds - FASTER FOR DEMO!
+
+print("Starting main loop with REAL-TIME updates...\n")
+
+while True:
+    try:
+        mqtt_client.check_msg()
+        
+        current_time = time.time()
+        
+        # Toggle BLUE LED for heartbeat
+        if current_time - last_flash >= FLASH_INTERVAL:
+            if BLUE_LED.value() == 0:
+                BLUE_LED.on()
+            else:
+                BLUE_LED.off()
+            last_flash = current_time
+        
+        # Read sensor and publish frequently for real-time updates
+        if current_time - last_sensor_read >= SENSOR_INTERVAL:
+            temp, hum = read_sensor()
+            last_sensor_read = current_time
+        
+        # Publish status frequently (REAL-TIME!)
+        if current_time - last_heartbeat >= HEARTBEAT_INTERVAL:
+            publish_status()
+            last_heartbeat = current_time
+            counter += 1
+        
+        # Energy Tracking
+        if current_time - last_energy_check >= ENERGY_CHECK_INTERVAL:
+            track_energy()
+            last_energy_check = current_time
+        
+        time.sleep(0.1)
+        
+    except OSError as e:
+        print(f"Network error: {e}")
+        print("Reconnecting...")
+        mqtt_client = mqtt_connect()
+        time.sleep(5)
+        
+    except Exception as e:
+        print(f"Main loop error: {e}")
+        time.sleep(2)
+# ----------------------------
+# Device setup
+# ----------------------------
+DEVICE_ID = "wokwi001"
+
+# WiFi setup
+WIFI_SSID = "Wokwi-GUEST"
+WIFI_PASSWORD = ""
+
+# MQTT setup
+MQTT_BROKER = "test.mosquitto.org"
+MQTT_PORT = 1883
+MQTT_TELEMETRY_TOPIC = f"iot/{DEVICE_ID}/telemetry"
+MQTT_CONTROL_TOPIC = f"iot/{DEVICE_ID}/control"
+
+# LED setup
+RED_LED = Pin(12, Pin.OUT)
+GREEN_LED = Pin(13, Pin.OUT)
+BLUE_LED = Pin(14, Pin.OUT)
+
+# DHT Sensor setup
+DHT_PIN = 15
+sensor = dht.DHT22(Pin(DHT_PIN))
+
+# AC & FAN Hardware
+AC_RELAY = Pin(25, Pin.OUT)
+FAN_RELAY = Pin(26, Pin.OUT)
+FAN_SPEED_PIN = Pin(27, Pin.OUT)
+
+# State Variables
+ac_state = {
+    "power": False,
+    "target_temp": 24,
+    "mode": "cool"
+}
+
+fan_state = {
+    "power": False,
+    "speed": 2
+}
+
+# Energy tracking
+energy_data = {
+    "red_led_minutes": 0,
+    "green_led_minutes": 0,
+    "blue_led_minutes": 0,
+    "ac_minutes": 0,
+    "fan_minutes": 0,
+    "last_energy_track": time.time()
+}
+
+# Start with all devices OFF
+RED_LED.off()
+GREEN_LED.off()
+BLUE_LED.off()
+AC_RELAY.off()
+FAN_RELAY.off()
+FAN_SPEED_PIN.off()
+
+# Global variables
+mqtt_client = None
+led_manual_mode = {"red": False, "green": False}
+
+# ----------------------------
+# Sensor Reading Function
+# ----------------------------
+def read_sensor():
+    """Read temperature and humidity from DHT22 sensor"""
+    try:
+        sensor.measure()
+        temp = sensor.temperature()
+        humidity = sensor.humidity()
+        return temp, humidity
+    except Exception as e:
+        print(f"Sensor read error: {e}")
+        return None, None
+
+# ----------------------------
+# AC Control Function
+# ----------------------------
+def control_ac(power, target_temp=None, mode=None):
+    """Control AC relay and settings"""
+    global ac_state
+    
+    if target_temp is not None:
+        ac_state["target_temp"] = target_temp
+    
+    if mode is not None:
+        ac_state["mode"] = mode
+    
+    if power == "ON" or power == True or power == 1:
+        AC_RELAY.on()
+        ac_state["power"] = True
+        print(f"AC ON - Target: {ac_state['target_temp']}°C")
+    else:
+        AC_RELAY.off()
+        ac_state["power"] = False
+        print("AC OFF")
+    
+    return ac_state
+
+# ----------------------------
+# Fan Control Function
+# ----------------------------
+def control_fan(power, speed=None):
+    """Control Fan relay and speed"""
+    global fan_state
+    
+    if speed is not None:
+        fan_state["speed"] = max(1, min(3, int(speed)))
+    
+    if power == "ON" or power == True or power == 1:
+        FAN_RELAY.on()
+        fan_state["power"] = True
+        
+        if fan_state["speed"] == 1:
+            FAN_SPEED_PIN.off()
+            print("Fan ON - Speed: LOW (1)")
+        elif fan_state["speed"] == 2:
+            print("Fan ON - Speed: MEDIUM (2)")
+        else:
+            FAN_SPEED_PIN.on()
+            print("Fan ON - Speed: HIGH (3)")
+    else:
+        FAN_RELAY.off()
+        FAN_SPEED_PIN.off()
+        fan_state["power"] = False
+        print("Fan OFF")
+    
+    return fan_state
+
+# ----------------------------
+# Energy Tracking Function - DEMO MODE
+# ----------------------------
+def track_energy():
+    """Track energy usage - FAST MODE for demo (adds 3 minutes each time)"""
+    global energy_data
+    
+    current_time = time.time()
+    elapsed = (current_time - energy_data["last_energy_track"])
+    
+    # Add 3 minutes worth of tracking each time for visible demo
+    if elapsed >= 20:  # Every 20 seconds
+        if RED_LED.value():
+            energy_data["red_led_minutes"] += 3  # Add 3 minutes for demo
+        if GREEN_LED.value():
+            energy_data["green_led_minutes"] += 3
+        if BLUE_LED.value():
+            energy_data["blue_led_minutes"] += 3
+        if AC_RELAY.value():
+            energy_data["ac_minutes"] += 3  # Add 3 minutes for visible cost changes
+        if FAN_RELAY.value():
+            energy_data["fan_minutes"] += 3
+        
+        energy_data["last_energy_track"] = current_time
+        print(f"Energy tracked: AC={energy_data['ac_minutes']}min, Fan={energy_data['fan_minutes']}min")
+
+# ----------------------------
+# Schedule Execution Function
+# ----------------------------
+def execute_schedule(schedule_cmd):
+    """Execute scheduled actions"""
+    print(f"Executing Schedule: {schedule_cmd.get('name', 'Unnamed')}")
+    
+    actions = schedule_cmd.get("actions", [])
+    
+    for action in actions:
+        device = action.get("device", "").lower()
+        state = action.get("state", "OFF").upper()
+        
+        if device == "ac":
+            temp = action.get("temperature", 24)
+            mode = action.get("mode", "cool")
+            control_ac(state, temp, mode)
+        
+        elif device == "fan":
+            speed = action.get("speed", 2)
+            control_fan(state, speed)
+        
+        elif device == "red":
+            if state == "ON":
+                RED_LED.on()
+                led_manual_mode["red"] = True
+            else:
+                RED_LED.off()
+                led_manual_mode["red"] = False
+        
+        elif device == "green":
+            if state == "ON":
+                GREEN_LED.on()
+                led_manual_mode["green"] = True
+            else:
+                GREEN_LED.off()
+                led_manual_mode["green"] = False
+        
+        elif device == "all_leds":
+            if state == "ON":
+                RED_LED.on()
+                GREEN_LED.on()
+                led_manual_mode["red"] = True
+                led_manual_mode["green"] = True
+            else:
+                RED_LED.off()
+                GREEN_LED.off()
+                led_manual_mode["red"] = False
+                led_manual_mode["green"] = False
+    
+    publish_status()
+
+# ----------------------------
+# Callback Function
+# ----------------------------
+def did_receive_callback(topic, msg):
+    print("\nCommand received!")
+    
+    try:
+        topic_str = topic.decode('utf-8')
+        msg_str = msg.decode('utf-8').strip()
+        print(f"Topic: {topic_str}")
+        print(f"Message: {msg_str}")
+    except Exception as e:
+        print("Decoding error:", e)
+        return
+    
+    if topic_str == MQTT_CONTROL_TOPIC:
+        try:
+            cmd = ujson.loads(msg_str)
+            
+            # Original LED Control
+            led_name = cmd.get("led", "").lower()
+            state = cmd.get("state", "").upper()
+            
+            if led_name == "red":
+                if state == "ON":
+                    RED_LED.on()
+                    led_manual_mode["red"] = True
+                    print("RED LED ON")
+                elif state == "OFF":
+                    RED_LED.off()
+                    led_manual_mode["red"] = False
+                    print("RED LED OFF")
+                    
+            elif led_name == "green":
+                if state == "ON":
+                    GREEN_LED.on()
+                    led_manual_mode["green"] = True
+                    print("GREEN LED ON")
+                elif state == "OFF":
+                    GREEN_LED.off()
+                    led_manual_mode["green"] = False
+                    print("GREEN LED OFF")
+                    
+            elif led_name == "both" or led_name == "all":
+                if state == "ON":
+                    RED_LED.on()
+                    GREEN_LED.on()
+                    led_manual_mode["red"] = True
+                    led_manual_mode["green"] = True
+                    print("ALL LEDs ON")
+                elif state == "OFF":
+                    RED_LED.off()
+                    GREEN_LED.off()
+                    led_manual_mode["red"] = False
+                    led_manual_mode["green"] = False
+                    print("ALL LEDs OFF")
+            
+            # New Device Controls
+            device = cmd.get("device", "").lower()
+            
+            if device == "ac":
+                temp = cmd.get("temperature", 24)
+                mode = cmd.get("mode", "cool")
+                control_ac(state, temp, mode)
+            
+            elif device == "fan":
+                speed = cmd.get("speed", 2)
+                control_fan(state, speed)
+            
+            elif device == "schedule":
+                execute_schedule(cmd)
+            
+            # Immediately publish updated status
+            publish_status()
+            
+        except Exception as e:
+            print(f"Command parsing error: {e}")
+
+# ----------------------------
+# Status Publishing (FASTER UPDATES!)
+# ----------------------------
+def publish_status():
+    """Publish current status - called frequently for real-time updates"""
+    try:
+        temp, humidity = read_sensor()
+        
+        status = {
+            "device_id": DEVICE_ID,
+            "red_led": RED_LED.value(),
+            "green_led": GREEN_LED.value(),
+            "blue_led": BLUE_LED.value(),
+            "temperature": temp,
+            "humidity": humidity,
+            "ac_power": ac_state["power"],
+            "ac_target_temp": ac_state["target_temp"],
+            "ac_mode": ac_state["mode"],
+            "fan_power": fan_state["power"],
+            "fan_speed": fan_state["speed"],
+            "energy": energy_data.copy(),
+            "timestamp": time.time()
+        }
+        
+        mqtt_client.publish(MQTT_TELEMETRY_TOPIC, ujson.dumps(status))
+        print(f"Published: Temp={temp}°C, Hum={humidity}%, AC={ac_state['power']}, Fan={fan_state['power']}")
+    except Exception as e:
+        print(f"Publish error: {e}")
+
+# ----------------------------
+# MQTT Functions
+# ----------------------------
+def mqtt_connect():
+    global mqtt_client
+    print("Connecting to MQTT...")
+    
+    try:
+        client = MQTTClient(DEVICE_ID, MQTT_BROKER, port=MQTT_PORT)
+        client.set_callback(did_receive_callback)
+        client.connect()
+        print("MQTT Connected!")
+        
+        client.subscribe(MQTT_CONTROL_TOPIC)
+        print(f"Subscribed to: {MQTT_CONTROL_TOPIC}")
+        
+        mqtt_client = client
+        return client
+    except Exception as e:
+        print(f"MQTT Connection failed: {e}")
+        return None
+
+# ----------------------------
+# WiFi Connection - WOKWI OPTIMIZED
+# ----------------------------
+def connect_wifi():
+    print("Initializing WiFi...")
+    
+    # Initialize WiFi interface properly
+    wlan = network.WLAN(network.STA_IF)
+    wlan.active(False)  # Turn off first
+    time.sleep(0.1)
+    wlan.active(True)   # Turn on fresh
+    time.sleep(0.5)     # Let it initialize
+    
+    print(f"Connecting to '{WIFI_SSID}'...")
+    
+    # Connect
+    wlan.connect(WIFI_SSID, WIFI_PASSWORD)
+    
+    # Wait for connection with longer timeout for Wokwi
+    max_wait = 30
+    for i in range(max_wait):
+        status = wlan.status()
+        
+        # Check if connected
+        if wlan.isconnected():
+            print(f"\nWiFi Connected!")
+            print(f"IP: {wlan.ifconfig()[0]}")
+            print(f"Time: {i+1} seconds\n")
+            return True
+        
+        # Show status
+        if i % 5 == 0:
+            print(f"Status: {status}, Attempt: {i+1}/{max_wait}")
+        
+        time.sleep(1)
+    
+    print("\nWiFi connection failed!")
+    print(f"Final status: {wlan.status()}")
+    return False
+
+# ----------------------------
+# Main Program
+# ----------------------------
+print("\n" + "="*50)
+print("ESP32 SMART HOME CONTROLLER")
+print("REAL-TIME MODE - 5 Second Updates")
+print("="*50 + "\n")
+
+# Connect WiFi
+if not connect_wifi():
+    print("ERROR: Cannot connect to WiFi")
+    while True:
+        RED_LED.on()
+        time.sleep(0.5)
+        RED_LED.off()
+        time.sleep(0.5)
+
+# Connect MQTT
+mqtt_client = mqtt_connect()
+if not mqtt_client:
+    print("ERROR: Cannot connect to MQTT")
+    while True:
+        RED_LED.on()
+        time.sleep(0.2)
+        RED_LED.off()
+        time.sleep(0.2)
+
+print("\nSYSTEM READY!")
+print(f"Control Topic: {MQTT_CONTROL_TOPIC}")
+print(f"Telemetry Topic: {MQTT_TELEMETRY_TOPIC}")
+print("\nREAL-TIME MODE:")
+print("  - Sensor readings every 5 seconds")
+print("  - Instant updates on commands")
+print("  - Fast app synchronization")
+print("")
+
+# Test sensor
+temp, hum = read_sensor()
+if temp is not None:
+    print(f"Initial reading: {temp}°C, {hum}%\n")
+
+# Publish initial status
+publish_status()
+
+# ----------------------------
+# Main Loop - REAL-TIME UPDATES!
+# ----------------------------
+counter = 0
+last_sensor_read = time.time()
+last_heartbeat = time.time()
+last_flash = time.time()
+last_energy_check = time.time()
+
+SENSOR_INTERVAL = 5        # Read sensor every 5 seconds
+HEARTBEAT_INTERVAL = 5     # Publish status every 5 seconds
+FLASH_INTERVAL = 0.5       # Heartbeat LED
+ENERGY_CHECK_INTERVAL = 20 # Track energy every 20 seconds - FASTER FOR DEMO!
+
+print("Starting main loop with REAL-TIME updates...\n")
+
+while True:
+    try:
+        mqtt_client.check_msg()
+        
+        current_time = time.time()
+        
+        # Toggle BLUE LED for heartbeat
+        if current_time - last_flash >= FLASH_INTERVAL:
+            if BLUE_LED.value() == 0:
+                BLUE_LED.on()
+            else:
+                BLUE_LED.off()
+            last_flash = current_time
+        
+        # Read sensor and publish frequently for real-time updates
+        if current_time - last_sensor_read >= SENSOR_INTERVAL:
+            temp, hum = read_sensor()
+            last_sensor_read = current_time
+        
+        # Publish status frequently (REAL-TIME!)
+        if current_time - last_heartbeat >= HEARTBEAT_INTERVAL:
+            publish_status()
+            last_heartbeat = current_time
+            counter += 1
+        
+        # Energy Tracking
+        if current_time - last_energy_check >= ENERGY_CHECK_INTERVAL:
+            track_energy()
+            last_energy_check = current_time
+        
+        time.sleep(0.1)
+        
+    except OSError as e:
+        print(f"Network error: {e}")
+        print("Reconnecting...")
+        mqtt_client = mqtt_connect()
+        time.sleep(5)
+        
+    except Exception as e:
+        print(f"Main loop error: {e}")
+        time.sleep(2)
