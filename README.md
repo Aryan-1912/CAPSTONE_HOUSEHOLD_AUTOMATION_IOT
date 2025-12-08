@@ -20,9 +20,7 @@ ESP32-based home automation system with real-time sensor monitoring, relay contr
 
 ### Stage 1 - Core PCB Assembly ✓
 
-![Stage 1 Board](images/PRJ_real_pic.jpeg)
-
-- Single-layer PCB fabricated and assembled
+- Multi layered PCB fabricated and assembled
 - ESP32 DevKit integration with GPIO breakout
 - DHT sensor interface for environmental monitoring
 - Status LEDs with current-limiting resistors
