@@ -33,8 +33,9 @@ ESP32-based home automation system with real-time sensor monitoring, relay contr
 
 | Category | Technologies |
 |----------|-------------|
-| Microcontroller | ESP32 (MicroPython) |
-| Sensors | DHT22, PIR Motion Detector |
+| Microcontroller | ESP32 (c) |
+| Wokwi Simulation for circuit (micropython) |
+| Sensors | DHT22 |
 | Communication | MQTT, Wi-Fi |
 | PCB Design | Autodesk Fusion 360 Eagle |
 | Mobile App | Kotlin, Android Studio |
