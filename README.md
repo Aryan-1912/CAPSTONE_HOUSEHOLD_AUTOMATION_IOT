@@ -60,6 +60,7 @@ ESP32-based home automation system with real-time sensor monitoring, relay contr
 ---
 
 Team members
+
 **Manav Parikh**  
 Computer Engineering Technology | Sheridan College  
 **Dev Patel**  
